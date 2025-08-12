@@ -16,4 +16,11 @@ class BacktestEngine:
         self._engine = _RustBacktestEngine(cfg)
 
     def run(self, strategy: Any, bars: List[Dict[str, Any]]) -> Dict[str, Any]:
-        return self._engine.run(strategy, bars)  # type: ignore[no-any-return] 
+        return self._engine.run(strategy, bars)  # type: ignore[no-any-return]
+
+    def run_multi(self, strategy: Any, feeds: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+        """
+        Run multi-asset/multi-feed backtest. Feeds is a dict: {feed_id: list[bar]}.
+        Each bar should include at least: datetime, close; optional: open/high/low/volume/symbol.
+        """
+        return self._engine.run_multi(strategy, feeds)  # type: ignore[no-any-return] 

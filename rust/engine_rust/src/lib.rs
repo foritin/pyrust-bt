@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 // 预提取的bar数据结构
 #[derive(Clone, Debug)]
@@ -12,6 +13,7 @@ struct BarData {
     low: f64,
     close: f64,
     volume: f64,
+    symbol: Option<String>,
 }
 
 #[pyclass]
@@ -67,6 +69,7 @@ struct Order {
     size: f64,
     limit_price: Option<f64>,
     status: &'static str,
+    symbol: String,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -198,6 +201,7 @@ fn extract_bars_data(bars: &PyList) -> PyResult<Vec<BarData>> {
         let low = bar.get_item("low")?.and_then(|v| v.extract::<f64>().ok()).unwrap_or(0.0);
         let close = bar.get_item("close")?.and_then(|v| v.extract::<f64>().ok()).unwrap_or(0.0);
         let volume = bar.get_item("volume")?.and_then(|v| v.extract::<f64>().ok()).unwrap_or(0.0);
+        let symbol = bar.get_item("symbol")?.and_then(|v| v.extract::<String>().ok());
         
         bars_data.push(BarData {
             datetime,
@@ -206,10 +210,26 @@ fn extract_bars_data(bars: &PyList) -> PyResult<Vec<BarData>> {
             low,
             close,
             volume,
+            symbol,
         });
     }
     
     Ok(bars_data)
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct EngineContext {
+    #[pyo3(get)]
+    pub position: f64,
+    #[pyo3(get)]
+    pub avg_cost: f64,
+    #[pyo3(get)]
+    pub cash: f64,
+    #[pyo3(get)]
+    pub equity: f64,
+    #[pyo3(get)]
+    pub bar_index: usize,
 }
 
 #[pyclass]
@@ -232,7 +252,15 @@ impl BacktestEngine {
         // 预提取所有bar数据到Rust结构中
         let bars_data = extract_bars_data(bars)?;
         
-        let _ = strategy.call_method1(py, "on_start", (py.None(),));
+        // 初始上下文（无价格时以现金估算净值）
+        let init_ctx = Py::new(py, EngineContext {
+            position: 0.0,
+            avg_cost: 0.0,
+            cash: self.cfg.cash,
+            equity: self.cfg.cash,
+            bar_index: 0,
+        })?;
+        let _ = strategy.call_method1(py, "on_start", (init_ctx.as_ref(py),));
 
         let mut pos = PositionState::new(self.cfg.cash);
         let mut order_seq: u64 = 1;
@@ -263,10 +291,34 @@ impl BacktestEngine {
                 bar_dict.set_item("close", bar_data.close)?;
                 bar_dict.set_item("volume", bar_data.volume)?;
 
-                let action_obj = strategy.call_method1(py, "next", (bar_dict.as_any(),))?;
+                // 上下文快照传入策略（优先使用 next(bar, ctx)，若失败则回退到 next(bar)）
+                let equity_snapshot = pos.cash + pos.position * last_price;
+                let ctx = Py::new(py, EngineContext {
+                    position: pos.position,
+                    avg_cost: pos.avg_cost,
+                    cash: pos.cash,
+                    equity: equity_snapshot,
+                    bar_index: i,
+                })?;
+                let action_obj = match strategy.call_method1(py, "next", (bar_dict.as_any(), ctx.as_ref(py))) {
+                    Ok(obj) => obj,
+                    Err(_) => strategy.call_method1(py, "next", (bar_dict.as_any(),))?,
+                };
 
                 // 快速订单处理
-                if let Some(order) = self.parse_action_fast(action_obj.as_ref(py), &mut order_seq, last_price)? {
+                let default_symbol = bar_data.symbol.as_deref().unwrap_or("DEFAULT");
+                if let Some(order) = self.parse_action_fast(action_obj.as_ref(py), &mut order_seq, last_price, default_symbol)? {
+                    // 订单提交回调
+                    let evt = PyDict::new_bound(py);
+                    evt.set_item("event", "submitted")?;
+                    evt.set_item("order_id", order.id)?;
+                    evt.set_item("side", match order.side { OrderSide::Buy => "BUY", OrderSide::Sell => "SELL" })?;
+                    evt.set_item("type", match order.otype { OrderType::Market => "market", OrderType::Limit => "limit" })?;
+                    evt.set_item("size", order.size)?;
+                    evt.set_item("symbol", &order.symbol)?;
+                    if let Some(lp) = order.limit_price { evt.set_item("limit_price", lp)?; }
+                    let _ = strategy.call_method1(py, "on_order", (evt.as_any(),));
+
                     if let Some((fill_price, fill_size)) = self.try_match(&order, last_price) {
                         let slip = self.cfg.slippage_bps / 10_000.0;
                         let sign = match order.side { OrderSide::Buy => 1.0, OrderSide::Sell => -1.0 };
@@ -276,6 +328,21 @@ impl BacktestEngine {
                         // 快速持仓更新
                         self.update_position(&mut pos, &order, exec_price, fill_size, commission);
                         trades.push((order.id, match order.side { OrderSide::Buy => "BUY".to_string(), OrderSide::Sell => "SELL".to_string() }, exec_price, fill_size));
+
+                        // 成交回调
+                        let trade_evt = PyDict::new_bound(py);
+                        trade_evt.set_item("order_id", order.id)?;
+                        trade_evt.set_item("side", match order.side { OrderSide::Buy => "BUY", OrderSide::Sell => "SELL" })?;
+                        trade_evt.set_item("price", exec_price)?;
+                        trade_evt.set_item("size", fill_size)?;
+                        trade_evt.set_item("symbol", &order.symbol)?;
+                        let _ = strategy.call_method1(py, "on_trade", (trade_evt.as_any(),));
+
+                        // 订单完成回调
+                        let evt2 = PyDict::new_bound(py);
+                        evt2.set_item("event", "filled")?;
+                        evt2.set_item("order_id", order.id)?;
+                        let _ = strategy.call_method1(py, "on_order", (evt2.as_any(),));
                     }
                 }
 
@@ -289,22 +356,28 @@ impl BacktestEngine {
         // 构建结果（优化版）
         self.build_result(py, pos, equity_curve, trades)
     }
+
+    /// 多资产/多周期（按联合时间线）回测（Python 暴露方法）
+    fn run_multi<'py>(&self, py: Python<'py>, strategy: PyObject, feeds: &'py PyAny) -> PyResult<PyObject> {
+        self._run_multi_impl(py, strategy, feeds)
+    }
 }
 
 impl BacktestEngine {
-    // 优化的动作解析，减少类型检查
+    // 优化的动作解析，减少类型检查（单资产路径）
     fn parse_action_fast<'py>(
         &self,
         action_obj: &PyAny,
         order_seq: &mut u64,
         last_price: f64,
+        default_symbol: &str,
     ) -> PyResult<Option<Order>> {
         // 快速字符串检查
         if let Ok(s) = action_obj.extract::<Option<String>>() {
             if let Some(act) = s {
                 let side = if act.as_bytes()[0] == b'B' { OrderSide::Buy } else { OrderSide::Sell };
                 let id = *order_seq; *order_seq += 1;
-                return Ok(Some(Order { id, side, otype: OrderType::Market, size: 1.0, limit_price: None, status: "submitted" }));
+                return Ok(Some(Order { id, side, otype: OrderType::Market, size: 1.0, limit_price: None, status: "submitted", symbol: default_symbol.to_string() }));
             }
         }
 
@@ -318,13 +391,44 @@ impl BacktestEngine {
             let otype = if otype_str == "limit" { OrderType::Limit } else { OrderType::Market };
             let size = d.get_item("size")?.and_then(|v| v.extract::<f64>().ok()).unwrap_or(1.0);
             let price = d.get_item("price")?.and_then(|v| v.extract::<f64>().ok());
+            let symbol = d.get_item("symbol")?.and_then(|v| v.extract::<String>().ok()).unwrap_or_else(|| default_symbol.to_string());
             
             let id = *order_seq; *order_seq += 1;
             let limit_price = if otype == OrderType::Limit { price.or(Some(last_price)) } else { None };
-            return Ok(Some(Order { id, side, otype, size, limit_price, status: "submitted" }));
+            return Ok(Some(Order { id, side, otype, size, limit_price, status: "submitted", symbol }));
         }
 
         Ok(None)
+    }
+
+    // 解析多指令：支持 list/tuple；若为单个则返回单元素
+    fn parse_actions_any<'py>(
+        &self,
+        py: Python<'py>,
+        action_obj: &PyAny,
+        order_seq: &mut u64,
+        last_price_map: &HashMap<String, f64>,
+        default_symbol: &str,
+    ) -> PyResult<Vec<Order>> {
+        if let Ok(seq) = action_obj.downcast::<pyo3::types::PyList>() {
+            let mut out = Vec::with_capacity(seq.len());
+            for item in seq.iter() {
+                // Try to read symbol first to get better last_price
+                let mut sym = default_symbol.to_string();
+                if let Ok(d) = item.downcast::<PyDict>() {
+                    if let Ok(Some(val)) = d.get_item("symbol") {
+                        if let Ok(s) = val.extract::<String>() { sym = s; }
+                    }
+                }
+                let lp = *last_price_map.get(&sym).unwrap_or(&0.0);
+                if let Some(o) = self.parse_action_fast(item, order_seq, lp, &sym)? { out.push(o); }
+            }
+            return Ok(out);
+        }
+        // Single
+        let lp = *last_price_map.get(default_symbol).unwrap_or(&0.0);
+        if let Some(o) = self.parse_action_fast(action_obj, order_seq, lp, default_symbol)? { return Ok(vec![o]); }
+        Ok(Vec::new())
     }
 
     #[inline]
@@ -498,11 +602,365 @@ impl BacktestEngine {
     }
 }
 
+impl BacktestEngine {
+    /// 多资产/多周期（按联合时间线）回测。feeds: Dict[str, List[bar]]，bar 至少包含 datetime/close，可选 symbol。
+    fn _run_multi_impl<'py>(&self, py: Python<'py>, strategy: PyObject, feeds: &'py PyAny) -> PyResult<PyObject> {
+        let feeds_dict: &PyDict = feeds.downcast()?;
+        // 预提取每个 feed 的数据
+        let mut feed_ids: Vec<String> = Vec::with_capacity(feeds_dict.len());
+        let mut feed_bars: Vec<Vec<BarData>> = Vec::with_capacity(feeds_dict.len());
+        for (k, v) in feeds_dict.iter() {
+            let fid: String = k.extract()?;
+            let blist: &PyList = v.downcast()?;
+            let bars_vec = extract_bars_data(blist)?;
+            feed_ids.push(fid);
+            feed_bars.push(bars_vec);
+        }
+
+        let n_feeds = feed_ids.len();
+        let mut idxs: Vec<usize> = vec![0; n_feeds];
+        let mut last_snapshot: Vec<Option<BarData>> = vec![None; n_feeds];
+
+        // 投资组合状态
+        let mut cash: f64 = self.cfg.cash;
+        let mut realized_pnl: f64 = 0.0;
+        let mut positions: HashMap<String, (f64, f64)> = HashMap::new(); // symbol -> (position, avg_cost)
+        let mut last_price_map: HashMap<String, f64> = HashMap::new();
+
+        // 结果容器
+        let mut equity_curve: Vec<(Option<String>, f64)> = Vec::new();
+        let mut trades: Vec<(u64, String, f64, f64)> = Vec::new();
+        let mut order_seq: u64 = 1;
+
+        // on_start 传入汇总 ctx（Python dict）
+        let start_ctx = PyDict::new_bound(py);
+        start_ctx.set_item("cash", cash)?;
+        start_ctx.set_item("equity", cash)?;
+        start_ctx.set_item("positions", PyDict::new_bound(py))?;
+        start_ctx.set_item("bar_index", 0usize)?;
+        let _ = strategy.call_method1(py, "on_start", (start_ctx.as_any(),));
+
+        let mut step: usize = 0;
+        loop {
+            // 找到下一个最小的 datetime
+            let mut min_dt: Option<String> = None;
+            for f in 0..n_feeds {
+                if idxs[f] < feed_bars[f].len() {
+                    if let Some(dt) = &feed_bars[f][idxs[f]].datetime {
+                        match &min_dt {
+                            None => min_dt = Some(dt.clone()),
+                            Some(cur) => { if dt < cur { min_dt = Some(dt.clone()); } }
+                        }
+                    }
+                }
+            }
+            if min_dt.is_none() { break; }
+            let cur_dt = min_dt.unwrap();
+
+            // 本步更新的 bars 切片
+            let update_slice = PyDict::new_bound(py);
+            for f in 0..n_feeds {
+                if idxs[f] < feed_bars[f].len() {
+                    if feed_bars[f][idxs[f]].datetime.as_ref() == Some(&cur_dt) {
+                        let b = &feed_bars[f][idxs[f]];
+                        // 更新 last
+                        last_snapshot[f] = Some(b.clone());
+                        if let Some(sym) = &b.symbol { last_price_map.insert(sym.clone(), b.close); }
+                        // 构造 bar dict
+                        let bd = PyDict::new_bound(py);
+                        if let Some(dt) = &b.datetime { bd.set_item("datetime", dt)?; }
+                        if let Some(sym) = &b.symbol { bd.set_item("symbol", sym)?; }
+                        bd.set_item("open", b.open)?;
+                        bd.set_item("high", b.high)?;
+                        bd.set_item("low", b.low)?;
+                        bd.set_item("close", b.close)?;
+                        bd.set_item("volume", b.volume)?;
+                        update_slice.set_item(&feed_ids[f], bd)?;
+                        idxs[f] += 1;
+                    }
+                }
+            }
+
+            // 构造 ctx：汇总 + 头寸 + last_prices
+            let ctx = PyDict::new_bound(py);
+            let pos_dict = PyDict::new_bound(py);
+            for (sym, (p, ac)) in positions.iter() {
+                let pd = PyDict::new_bound(py);
+                pd.set_item("position", *p)?;
+                pd.set_item("avg_cost", *ac)?;
+                pos_dict.set_item(sym, pd)?;
+            }
+            // 汇总净值
+            let mut equity: f64 = cash;
+            for (sym, (p, _)) in positions.iter() {
+                if let Some(lp) = last_price_map.get(sym) { equity += p * lp; }
+            }
+            ctx.set_item("positions", pos_dict)?;
+            ctx.set_item("cash", cash)?;
+            ctx.set_item("equity", equity)?;
+            ctx.set_item("bar_index", step)?;
+            ctx.set_item("last_prices", {
+                let lp = PyDict::new_bound(py);
+                for (k, v) in last_price_map.iter() { lp.set_item(k, v)?; }
+                lp
+            })?;
+
+            // 调用策略：next_multi(update_slice, ctx) 优先
+            let action_obj = match strategy.call_method1(py, "next_multi", (update_slice.as_any(), ctx.as_any())) {
+                Ok(obj) => obj,
+                Err(_) => {
+                    // 回退：若存在主 bar，则取第一个 feed 的最新快照
+                    let primary_bar = if let Some(Some(b)) = last_snapshot.get(0) {
+                        let bd = PyDict::new_bound(py);
+                        if let Some(dt) = &b.datetime { bd.set_item("datetime", dt)?; }
+                        if let Some(sym) = &b.symbol { bd.set_item("symbol", sym)?; }
+                        bd.set_item("open", b.open)?;
+                        bd.set_item("high", b.high)?;
+                        bd.set_item("low", b.low)?;
+                        bd.set_item("close", b.close)?;
+                        bd.set_item("volume", b.volume)?;
+                        Some(bd)
+                    } else { None };
+                    if let Some(pb) = primary_bar { strategy.call_method1(py, "next", (pb.as_any(), ctx.as_any()))? } else { py.None() }
+                }
+            };
+
+            // 解析并执行指令（支持 list）
+            let default_symbol = if let Some(Some(b)) = last_snapshot.get(0) {
+                b.symbol.clone().unwrap_or_else(|| "DEFAULT".to_string())
+            } else { "DEFAULT".to_string() };
+            let orders = self.parse_actions_any(py, action_obj.as_ref(py), &mut order_seq, &last_price_map, &default_symbol)?;
+            for order in orders {
+                // 获取该 symbol 的 last_price
+                let lp = *last_price_map.get(&order.symbol).unwrap_or(&0.0);
+                if let Some((fill_price, fill_size)) = self.try_match(&order, lp) {
+                    let slip = self.cfg.slippage_bps / 10_000.0;
+                    let sign = match order.side { OrderSide::Buy => 1.0, OrderSide::Sell => -1.0 };
+                    let exec_price = fill_price * (1.0 + sign * slip);
+                    let commission = exec_price * fill_size * self.cfg.commission_rate;
+
+                    // 更新该 symbol 头寸与组合现金
+                    let sp = positions.entry(order.symbol.clone()).or_insert((0.0_f64, 0.0_f64));
+                    match order.side {
+                        OrderSide::Buy => {
+                            let cost = exec_price * fill_size + commission;
+                            let new_pos = sp.0 + fill_size;
+                            if new_pos.abs() > f64::EPSILON {
+                                sp.1 = if sp.0.abs() > f64::EPSILON {
+                                    (sp.1 * sp.0 + exec_price * fill_size) / new_pos
+                                } else { exec_price };
+                            } else { sp.1 = 0.0; }
+                            sp.0 = new_pos;
+                            cash -= cost;
+                        }
+                        OrderSide::Sell => {
+                            let proceeds = exec_price * fill_size - commission;
+                            if sp.0 > 0.0 {
+                                let closing = fill_size.min(sp.0);
+                                realized_pnl += (exec_price - sp.1) * closing;
+                            }
+                            sp.0 -= fill_size;
+                            if sp.0.abs() < f64::EPSILON { sp.1 = 0.0; }
+                            cash += proceeds;
+                        }
+                    }
+
+                    // 记录交易与回调
+                    trades.push((order.id, match order.side { OrderSide::Buy => "BUY".to_string(), OrderSide::Sell => "SELL".to_string() }, exec_price, fill_size));
+                    let trade_evt = PyDict::new_bound(py);
+                    trade_evt.set_item("order_id", order.id)?;
+                    trade_evt.set_item("side", match order.side { OrderSide::Buy => "BUY", OrderSide::Sell => "SELL" })?;
+                    trade_evt.set_item("price", exec_price)?;
+                    trade_evt.set_item("size", fill_size)?;
+                    trade_evt.set_item("symbol", &order.symbol)?;
+                    let _ = strategy.call_method1(py, "on_trade", (trade_evt.as_any(),));
+                }
+            }
+
+            // 汇总净值并记录
+            let mut equity_step: f64 = cash;
+            for (sym, (p, _)) in positions.iter() {
+                if let Some(lp) = last_price_map.get(sym) { equity_step += p * lp; }
+            }
+            equity_curve.push((Some(cur_dt.clone()), equity_step));
+            step += 1;
+        }
+
+        let _ = strategy.call_method0(py, "on_stop");
+
+        // 构建结果
+        let result = PyDict::new_bound(py);
+        // 汇总头寸（简化：不返回逐 symbol 持仓，用户可在 on_trade / ctx 中获取）
+        result.set_item("cash", cash)?;
+        result.set_item("position", 0.0_f64)?;
+        result.set_item("avg_cost", 0.0_f64)?;
+        let last_eq = equity_curve.last().map(|(_, e)| *e).unwrap_or(cash);
+        result.set_item("equity", last_eq)?;
+        result.set_item("realized_pnl", realized_pnl)?;
+
+        let eq_list = PyList::empty_bound(py);
+        for (dt, eq) in &equity_curve {
+            let row = PyDict::new_bound(py);
+            if let Some(d) = dt { row.set_item("datetime", d)?; } else { row.set_item("datetime", py.None())?; }
+            row.set_item("equity", eq)?;
+            eq_list.append(row)?;
+        }
+        result.set_item("equity_curve", eq_list)?;
+
+        let tr_list = PyList::empty_bound(py);
+        for (oid, side, price, size) in &trades {
+            let t = PyDict::new_bound(py);
+            t.set_item("order_id", oid)?;
+            t.set_item("side", side)?;
+            t.set_item("price", price)?;
+            t.set_item("size", size)?;
+            tr_list.append(t)?;
+        }
+        result.set_item("trades", tr_list)?;
+
+        let stats = self.compute_enhanced_stats(py, &equity_curve, &trades)?;
+        result.set_item("stats", stats)?;
+
+        Ok(result.into())
+    }
+}
+
+#[pyfunction]
+fn factor_backtest_fast(py: Python<'_>, closes: Vec<f64>, factors: Vec<f64>, quantiles: usize, forward: usize) -> PyResult<PyObject> {
+    let n = closes.len().min(factors.len());
+    if quantiles < 2 || forward == 0 || n <= forward {
+        let empty = PyDict::new_bound(py);
+        empty.set_item("quantiles", PyList::empty_bound(py))?;
+        empty.set_item("mean_returns", PyList::empty_bound(py))?;
+        empty.set_item("ic", py.None())?;
+        empty.set_item("monotonicity", 0.0)?;
+        empty.set_item("q_bounds", PyList::empty_bound(py))?;
+        empty.set_item("factor_stats", PyDict::new_bound(py))?;
+        return Ok(empty.into());
+    }
+
+    let m = n - forward;
+
+    // Forward returns
+    let mut fwd_returns: Vec<f64> = Vec::with_capacity(m);
+    for i in 0..m {
+        let c0 = closes[i];
+        let c1 = closes[i + forward];
+        let r = if c0 != 0.0 { (c1 / c0) - 1.0 } else { 0.0 };
+        fwd_returns.push(r);
+    }
+
+    // Trimmed factors
+    let mut fac_trim: Vec<f64> = factors[..m].to_vec();
+
+    // Quantile bounds
+    let mut sorted = fac_trim.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut q_bounds: Vec<f64> = Vec::with_capacity(quantiles.saturating_sub(1));
+    for q in 1..quantiles {
+        let idx = (sorted.len() * q) / quantiles;
+        let idx = idx.min(sorted.len().saturating_sub(1));
+        q_bounds.push(sorted[idx]);
+    }
+
+    // Group stats (sums & counts)
+    let mut sums: Vec<f64> = vec![0.0; quantiles];
+    let mut counts: Vec<usize> = vec![0; quantiles];
+
+    for (val, ret) in fac_trim.iter().zip(fwd_returns.iter()) {
+        // Find group by linear scan (quantiles is small, typically <= 10)
+        let mut gi = 0usize;
+        while gi < q_bounds.len() && *val > q_bounds[gi] { gi += 1; }
+        sums[gi] += *ret;
+        counts[gi] += 1;
+    }
+
+    // Mean returns per quantile
+    let mut mean_returns: Vec<f64> = Vec::with_capacity(quantiles);
+    for i in 0..quantiles {
+        if counts[i] > 0 { mean_returns.push(sums[i] / counts[i] as f64); } else { mean_returns.push(0.0); }
+    }
+
+    // IC: Pearson correlation between fac_trim and fwd_returns
+    let sum_f: f64 = fac_trim.iter().sum();
+    let sum_r: f64 = fwd_returns.iter().sum();
+    let mean_f = sum_f / m as f64;
+    let mean_r = sum_r / m as f64;
+    let mut cov = 0.0_f64;
+    let mut var_f = 0.0_f64;
+    let mut var_r = 0.0_f64;
+    for i in 0..m {
+        let df = fac_trim[i] - mean_f;
+        let dr = fwd_returns[i] - mean_r;
+        cov += df * dr;
+        var_f += df * df;
+        var_r += dr * dr;
+    }
+    let denom = (var_f * var_r).sqrt() + 1e-12;
+    let ic = cov / denom;
+
+    // Monotonicity of mean returns across quantiles
+    let mut inc = 0i32;
+    let mut dec = 0i32;
+    if mean_returns.len() > 1 {
+        for i in 1..mean_returns.len() {
+            if mean_returns[i] > mean_returns[i - 1] { inc += 1; }
+            if mean_returns[i] < mean_returns[i - 1] { dec += 1; }
+        }
+    }
+    let denom_m = (mean_returns.len().saturating_sub(1)) as f64;
+    let monotonicity = if denom_m > 0.0 { (inc - dec) as f64 / denom_m } else { 0.0 };
+
+    // Factor stats
+    let min_f = fac_trim
+        .iter()
+        .cloned()
+        .fold(f64::INFINITY, |a, b| if b < a { b } else { a });
+    let max_f = fac_trim
+        .iter()
+        .cloned()
+        .fold(f64::NEG_INFINITY, |a, b| if b > a { b } else { a });
+    let mean_f_all = mean_f;
+    let std_f = if m > 1 {
+        let mut vs = 0.0_f64;
+        for v in fac_trim.iter() { let d = *v - mean_f_all; vs += d * d; }
+        (vs / m as f64).sqrt()
+    } else { 0.0 };
+
+    // Build Python result dict
+    let out = PyDict::new_bound(py);
+    let q_list = PyList::empty_bound(py);
+    for i in 1..=quantiles { q_list.append(i as i32)?; }
+    out.set_item("quantiles", q_list)?;
+
+    let mr_list = PyList::empty_bound(py);
+    for v in mean_returns.iter() { mr_list.append(*v)?; }
+    out.set_item("mean_returns", mr_list)?;
+
+    out.set_item("ic", ic)?;
+    out.set_item("monotonicity", monotonicity)?;
+
+    let qb_list = PyList::empty_bound(py);
+    for v in q_bounds.iter() { qb_list.append(*v)?; }
+    out.set_item("q_bounds", qb_list)?;
+
+    let fs = PyDict::new_bound(py);
+    fs.set_item("mean", mean_f_all)?;
+    fs.set_item("std", std_f)?;
+    fs.set_item("min", min_f)?;
+    fs.set_item("max", max_f)?;
+    out.set_item("factor_stats", fs)?;
+
+    Ok(out.into())
+}
+
 #[pymodule]
 fn engine_rust(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<BacktestConfig>()?;
     m.add_class::<BacktestEngine>()?;
+    m.add_class::<EngineContext>()?;
     m.add_function(wrap_pyfunction!(compute_sma, m)?)?;
     m.add_function(wrap_pyfunction!(compute_rsi, m)?)?;
+    m.add_function(wrap_pyfunction!(factor_backtest_fast, m)?)?;
     Ok(())
 } 

@@ -11,6 +11,29 @@ from pyrust_bt.data import load_csv_to_bars
 from pyrust_bt.strategy import Strategy
 from pyrust_bt.analyzers import compute_drawdown_segments, round_trips_from_trades, export_trades_to_csv, factor_backtest
 
+# Try vectorized SMA from Rust if available
+try:
+    from engine_rust import compute_sma as _rs_sma
+except Exception:
+    _rs_sma = None
+
+
+def compute_sma_py(closes: List[float], window: int) -> List[float | None]:
+    if window <= 0:
+        raise ValueError("window must be > 0")
+    out: List[float | None] = []
+    s = 0.0
+    for i, v in enumerate(closes):
+        s += v
+        if i + 1 < window:
+            out.append(None)
+        elif i + 1 == window:
+            out.append(s / window)
+        else:
+            s -= closes[i - window]
+            out.append(s / window)
+    return out
+
 
 class FactorStrategy(Strategy):
     def __init__(self, window: int = 3, size: float = 1.0) -> None:
@@ -22,33 +45,41 @@ class FactorStrategy(Strategy):
         close = float(bar["close"])  # type: ignore[assignment]
         self._closes.append(close)
         if len(self._closes) < self.window:
-            bar["factor"] = None
             return None
         sma = sum(self._closes[-self.window :]) / self.window
-        factor = close - sma
-        bar["factor"] = factor
-        if factor > 0:
+        if close > sma:
             return {"action": "BUY", "type": "market", "size": self.size}
-        elif factor < 0:
+        elif close < sma:
             return {"action": "SELL", "type": "market", "size": self.size}
         return None
 
 
 def main() -> None:
     cfg = BacktestConfig(
-        start="2016-01-01",
-        end="2025-12-31",
+        start="2020-01-01",
+        end="2020-12-31",
         cash=10000.0,
-        commission_rate=0.0005,  # 5 bps 手续费
-        slippage_bps=2.0,        # 2 bps 滑点
+        commission_rate=0.0005,
+        slippage_bps=2.0,
+        batch_size=2000,
     )
     engine = BacktestEngine(cfg)
 
-    # Prepare data (expects a CSV at examples/data/sample.csv)
-    data_path = os.path.join(os.path.dirname(__file__), "data", "sh600000_min.csv")
+    data_path = os.path.join(os.path.dirname(__file__), "data", "sample.csv")
     bars = load_csv_to_bars(data_path, symbol="SAMPLE")
 
-    strat = FactorStrategy(window=3, size=1.0)
+    # Pre-compute factor: close - SMA(window)
+    window = 3
+    closes = [float(b["close"]) for b in bars]
+    if _rs_sma is not None:
+        sma = _rs_sma(closes, window)
+    else:
+        sma = compute_sma_py(closes, window)
+    for i, b in enumerate(bars):
+        f = None if sma[i] is None else (closes[i] - float(sma[i]))
+        b["factor"] = 0.0 if f is None else float(f)
+
+    strat = FactorStrategy(window=window, size=1.0)
     res = engine.run(strat, bars)
 
     equity_curve = res["equity_curve"]
@@ -66,7 +97,7 @@ def main() -> None:
     export_trades_to_csv(trades, out_csv)
     print("Trades exported to:", out_csv)
 
-    # Factor backtest over bars (factor written in strategy)
+    # Factor backtest over bars (factor is precomputed into bars)
     fb = factor_backtest(bars, factor_key="factor", quantiles=3, forward=1)
     print("Factor backtest:", fb)
 

@@ -4,6 +4,11 @@ from typing import Any, Dict, List, Tuple, Iterable, Optional
 import csv
 import math
 
+try:
+    from engine_rust import factor_backtest_fast as _factor_backtest_fast  # type: ignore
+except Exception:  # pragma: no cover
+    _factor_backtest_fast = None  # type: ignore
+
 
 @dataclass
 class DrawdownSegment:
@@ -293,11 +298,22 @@ def factor_backtest(
     quantiles: int = 5,
     forward: int = 1,
 ) -> Dict[str, Any]:
-    """增强的因子回测分析"""
+    """增强的因子回测分析（自动走 Rust 快速路径）。"""
     n = len(bars)
     if n <= forward or quantiles < 2:
         return {"quantiles": [], "mean_returns": [], "ic": None}
 
+    # 当数据量较大且 Rust 加速可用时，走快速路径
+    if _factor_backtest_fast is not None and n > 5000:
+        closes: List[float] = []
+        factors: List[float] = []
+        for i in range(n):
+            closes.append(float(bars[i]["close"]))  # type: ignore[assignment]
+            v = bars[i].get(factor_key)
+            factors.append(float(v) if v is not None else 0.0)
+        return _factor_backtest_fast(closes, factors, quantiles, forward)  # type: ignore[no-any-return]
+
+    # Python 回退实现（小数据或无 Rust 快速路径）
     # 计算前向收益
     fwd_returns: List[float] = []
     for i in range(n - forward):
@@ -333,16 +349,16 @@ def factor_backtest(
         groups[group_idx].append(ret)
 
     mean_returns = [sum(g) / len(g) if g else 0.0 for g in groups]
-    
+
     # IC计算（皮尔逊相关）
     if len(factor_values) == len(fwd_returns) and len(factor_values) > 1:
         mean_fac = sum(factor_values) / len(factor_values)
         mean_ret = sum(fwd_returns) / len(fwd_returns)
-        
+
         cov = sum((f - mean_fac) * (r - mean_ret) for f, r in zip(factor_values, fwd_returns))
         var_fac = sum((f - mean_fac) ** 2 for f in factor_values)
         var_ret = sum((r - mean_ret) ** 2 for r in fwd_returns)
-        
+
         ic = cov / (math.sqrt(var_fac * var_ret) + 1e-12)
     else:
         ic = 0.0

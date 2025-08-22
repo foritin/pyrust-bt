@@ -10,6 +10,33 @@
 - 前端：React + ECharts/Plotly 交互式 UI；WebSocket 实时日志/进度/曲线
 - 质量工程：完善单元/集成/回归测试，基准测试；CI 构建与发布
 
+## [0.1.2] - 2025-08-22
+### 新增
+- 横截面因子分层回测器：
+  - `python/pyrust_bt/cs_factor_backtester.py`：逐日分桶（`quantiles`）、截面去极值（`winsorize`）与标准化（`standardize`）；导出分位/多空收益与净值、统计与换手（CSV/JSON）；内置 demo 导出至 `examples/results/cs_backtester_demo/`。
+- 多因子分析器（横截面口径）：
+  - `python/pyrust_bt/multi_factor_analyzer.py`：逐日分桶、截面 Spearman IC/ICIR/胜率、分位平均前瞻收益、单调性；最高分位换手；因子衰减（多前瞻期 IC）；稳定性评分。时间序列口径支持大样本 Numba 自动加速。
+- 示例脚本：
+  - `examples/run_cs_momentum_sample.py`：横截面动量因子评价与报告导出。
+  - `examples/run_cs_quantile_portfolios.py`：分位组合交易模拟，导出交易与净值。
+- 文档：
+  - 更新 `README.md` / `README.zh-CN.md`：新增横截面因子分析与分位组合回测的说明与示例入口。
+
+### 变更
+- 目录结构中新增：
+  - `python/pyrust_bt/multi_factor_analyzer.py`、`python/pyrust_bt/cs_factor_backtester.py`
+  - 示例：`examples/run_cs_momentum_sample.py`、`examples/run_cs_quantile_portfolios.py`
+- 快速开始与功能概览补充“横截面因子分析/分位组合回测”。
+
+### 注意（兼容性）
+- `CrossSectionFactorBacktester` 期望输入包含列：`datetime`、`symbol`、因子列（默认 `factor`）与下一期收益列（默认 `ret_next`），类型需可转换为 `datetime`/`float`。
+- `MultiFactorAnalyzer` 的横截面分析需包含 `close` 价格列；`winsorize/standardize` 为可选，缺失值策略通过 `nan_policy` 控制。
+- 若未安装 Numba，时间序列 IC 自动回退至 Pandas 实现，无需额外配置。
+
+### 性能
+- 时间序列 IC 在大样本（≥5k）时启用 Numba 分段窗口计算，减少 rolling 相关的开销。
+- 截面分桶与统计向量化实现，提升批量因子评价吞吐。
+
 ## [0.1.1] - 2025-08-12
 ### 新增
 - 多资产/多周期回测（MVP）：

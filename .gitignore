@@ -8,6 +8,9 @@ target/
 .venv/
 .maturin/ 
 
+.env
+CLAUDE.md
+
 # --- Rust ---
 /target/
 rust/engine_rust/rustup-init.exe

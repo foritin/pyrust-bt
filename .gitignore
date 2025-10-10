@@ -76,4 +76,6 @@ examples/data/*
 examples/data/trades_out.csv
 examples/data/round_trips.csv 
 
+examples/results/*
+
 doc/*md

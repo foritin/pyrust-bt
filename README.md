@@ -21,6 +21,7 @@ A hybrid backtesting framework: Python for strategy and data, Rust for the high-
     - Dict: `{ "action": "BUY"|"SELL", "type": "market"|"limit", "size": float, "price"?: float }`
   - Data loader: CSV → list[dict] (MVP; pluggable for Parquet/Arrow)
   - Analyzers: drawdown segments, round-trips, enhanced performance metrics, factor backtests (quantiles/IC/monotonicity), unified report
+  - **Cross-sectional Factor Analysis**: multi-factor evaluation system, quantile portfolio backtesting, IC/ICIR analysis, factor ranking
   - Optimizer: naive grid search (customizable scoring key)
 
 - API & Frontend
@@ -49,6 +50,14 @@ maturin develop --release
 - Grid search
   ```powershell
   python examples/run_grid_search.py
+  ```
+- Cross-sectional factor backtesting
+  ```powershell
+  python examples/run_cs_momentum_sample.py
+  ```
+- Quantile portfolio backtesting with trading simulation
+  ```powershell
+  python examples/run_cs_quantile_portfolios.py
   ```
 - Performance test & batch-size comparison
   ```powershell
@@ -88,6 +97,11 @@ Sample data: `examples/data/sample.csv` (headers: `datetime,open,high,low,close,
 - Performance metrics: `compute_performance_metrics(equity_curve)` (Sharpe/Sortino/Calmar/VAR)
 - Factor backtest: `factor_backtest(bars, factor_key, quantiles, forward)`
 - Unified report: `generate_analysis_report(...)`
+- **Cross-sectional Factor Evaluation**:
+  - Multi-factor analyzer: `MultiFactorAnalyzer` with time-series/cross-sectional methods
+  - Factor ranking: IC, ICIR, monotonicity, stability, turnover analysis
+  - Quantile portfolio backtesting: `CrossSectionFactorBacktester` for large-scale factor evaluation
+  - Export: detailed reports, factor rankings, correlation matrices
 
 ## API & Frontend
 - Start API (FastAPI)
@@ -110,7 +124,11 @@ Sample data: `examples/data/sample.csv` (headers: `datetime,open,high,low,close,
 ## Project Structure
 - `rust/engine_rust`: Rust engine (PyO3), indicators & stats
 - `python/pyrust_bt`: Python API/strategy/data/analyzers/optimizer
+- `python/pyrust_bt/multi_factor_analyzer.py`: Multi-factor evaluation system
+- `python/pyrust_bt/cs_factor_backtester.py`: Cross-sectional factor backtesting
 - `examples`: MVP, analyzers, grid search, performance tests
+- `examples/run_cs_momentum_sample.py`: Cross-sectional momentum factor demo
+- `examples/run_cs_quantile_portfolios.py`: Quantile portfolio trading simulation
 - `frontend`: Streamlit UI
 
 ## TODO / Roadmap
@@ -124,6 +142,7 @@ Sample data: `examples/data/sample.csv` (headers: `datetime,open,high,low,close,
 - Analysis/Reports
   - Rich analyzers (group stats, drawdown visualization, trade distributions)
   - Report export (PDF/HTML) & multi-run comparison
+  - Advanced factor analysis (industry/market cap neutralization, rolling quantiles)
 - Optimization/Parallelism
   - Random/Bayesian search, cross-validation
   - Multi-process/distributed runs (Ray/Celery/k8s Jobs)

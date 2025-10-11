@@ -1,8 +1,13 @@
 # pyrust-bt
 
+<div  align="center">   
+<img src="images/logo.jpeg" width = "200" height = "200" alt="" align=center />
+</div>
+
 A hybrid backtesting framework: Python for strategy and data, Rust for the high-performance core via PyO3 bindings. Designed to balance researcher productivity with engine throughput, suitable from research to small-team production.
 
 [中文文档 | Chinese README](README.zh-CN.md)
+
 
 ## Features
 - Rust Engine
